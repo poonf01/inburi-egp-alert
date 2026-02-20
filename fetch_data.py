@@ -2,9 +2,8 @@ import os
 import json
 import time
 import subprocess
-import urllib.parse
 import requests
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # ======================
 # ENV
@@ -12,9 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 LINE_TOKEN = os.environ.get("LINE_TOKEN", "").strip()
 API_KEY = os.environ.get("DATA_API_KEY", "").strip()
 RESOURCE_ID = os.environ.get("DATA_RESOURCE_ID", "").strip()
-
-# Proxy ที่รันไว้ที่อื่น (Render/Railway/VPS)
-PROXY_URL = os.environ.get("PROXY_URL", "").strip().rstrip("/")
 
 # ======================
 # CONSTANTS
@@ -26,16 +22,13 @@ LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 DATA_JSON_PATH = "data.json"
 
 # ======================
-# HEADERS (กัน WAF ให้เต็ม)
+# HEADERS
 # ======================
 HEADERS_API = {
     "api-key": API_KEY,
     "x-api-key": API_KEY,
     "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Connection": "keep-alive",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -60,7 +53,6 @@ def require_env() -> bool:
     if not API_KEY: missing.append("DATA_API_KEY")
     if not LINE_TOKEN: missing.append("LINE_TOKEN")
     if not RESOURCE_ID: missing.append("DATA_RESOURCE_ID")
-
     if missing:
         print("❌ Missing environment variables:", ", ".join(missing))
         return False
@@ -70,23 +62,20 @@ def _short(text: str, n: int = 250) -> str:
     t = (text or "").replace("\n", " ").replace("\r", " ").strip()
     return t[:n]
 
-def _build_url(url: str, params: Dict[str, Any]) -> str:
-    # ใช้ quote เพื่อไม่ให้มีปัญหา + หรือช่องว่างในคำสั่ง curl
-    q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}, quote_via=urllib.parse.quote)
-    return f"{url}?{q}" if q else url
-
-def _curl_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
-    full_url = _build_url(url, params)
+# แก้ให้ใช้ POST ยัดใส่ Payload แทน URL เพื่อหลบ WAF และหลีกเลี่ยง curl URL error
+def _curl_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 70) -> Dict[str, Any]:
     cmd = [
         "curl", "-sS", "-L", "--compressed",
         "--connect-timeout", str(timeout),
         "--max-time", str(timeout),
-        full_url
+        "-X", "POST",
+        "-H", "Content-Type: application/json"
     ]
     for k, v in headers.items():
         if v:
-            cmd.insert(-1, f"{k}: {v}")
-            cmd.insert(-1, "-H")
+            cmd.extend(["-H", f"{k}: {v}"])
+    
+    cmd.extend(["-d", json.dumps(payload), url])
 
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -97,13 +86,13 @@ def _curl_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], ti
     except Exception:
         raise RuntimeError(f"curl returned non-json: {_short(p.stdout)}")
 
-def _requests_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], retries: int = 3, timeout: int = 45) -> Dict[str, Any]:
+def _requests_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], retries: int = 3, timeout: int = 45) -> Dict[str, Any]:
     session = requests.Session()
     last_err: Optional[Exception] = None
 
     for i in range(retries):
         try:
-            resp = session.get(url, headers=headers, params=params, timeout=timeout)
+            resp = session.post(url, headers=headers, json=payload, timeout=timeout)
             if resp.status_code < 400:
                 return resp.json()
 
@@ -125,12 +114,12 @@ def _requests_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any]
 
     raise RuntimeError(f"requests failed after retries: {last_err}")
 
-def get_json_with_fallback(url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Dict[str, Any]:
+def get_json_with_fallback(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        return _requests_get_json(url, headers, params)
+        return _requests_post_json(url, headers, payload)
     except Exception as e1:
         print(f"⚠️ requests failed -> trying curl fallback ...")
-    return _curl_get_json(url, headers, params, timeout=70)
+    return _curl_post_json(url, headers, payload)
 
 def load_old_data(path: str = DATA_JSON_PATH) -> List[Dict[str, Any]]:
     if not os.path.exists(path): return []
@@ -156,42 +145,24 @@ def send_line_notify(project_name: str, budget: str, department: str) -> None:
     )
     payload = {"messages": [{"type": "text", "text": message}]}
     try:
-        resp = requests.post(LINE_BROADCAST_URL, headers=HEADERS_LINE, json=payload, timeout=30)
-        if resp.status_code >= 400:
-            print(f"⚠️ LINE notify failed: HTTP {resp.status_code}")
+        requests.post(LINE_BROADCAST_URL, headers=HEADERS_LINE, json=payload, timeout=30)
     except Exception as e:
         print(f"⚠️ LINE notify exception: {e}")
 
 # ======================
 # FETCH
 # ======================
-def fetch_records_via_proxy() -> List[Dict[str, Any]]:
-    if not PROXY_URL: return []
-    url = f"{PROXY_URL}/egp"
-    print(f"🌐 Using PROXY_URL: {url}")
-    try:
-        # Request ไปยัง Proxy ไม่ต้องส่ง Header api-key เพราะ Proxy จัดการให้
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("result", {}).get("records", []) or []
-    except Exception as e:
-        print(f"⚠️ Proxy fetch failed: {e}")
-        return []
-
 def fetch_records_sql(resource_id: str) -> List[Dict[str, Any]]:
-    sql = f"""
-    SELECT * FROM "{resource_id}"
-    WHERE project_name LIKE '%อินทร์บุรี%' OR prov_name LIKE '%สิงห์บุรี%' OR dept_name LIKE '%อินทร์บุรี%'
-    LIMIT 200
-    """
-    data = get_json_with_fallback(OPEND_DATASTORE_SQL, headers=HEADERS_API, params={"sql": sql})
+    # ยิง POST พร้อม payload ไม่แปะบน URL แล้ว
+    sql = f"""SELECT * FROM "{resource_id}" WHERE project_name LIKE '%อินทร์บุรี%' OR prov_name LIKE '%สิงห์บุรี%' OR dept_name LIKE '%อินทร์บุรี%' LIMIT 200"""
+    data = get_json_with_fallback(OPEND_DATASTORE_SQL, headers=HEADERS_API, payload={"sql": sql})
     return data.get("result", {}).get("records", []) or []
 
 def fetch_records_search(resource_id: str) -> List[Dict[str, Any]]:
     out, seen = [], set()
     for q in ["อินทร์บุรี", "สิงห์บุรี"]:
-        data = get_json_with_fallback(OPEND_DATASTORE_SEARCH, headers=HEADERS_API, params={"resource_id": resource_id, "q": q, "limit": 200})
+        payload = {"resource_id": resource_id, "q": q, "limit": 200}
+        data = get_json_with_fallback(OPEND_DATASTORE_SEARCH, headers=HEADERS_API, payload=payload)
         for r in (data.get("result", {}).get("records", []) or []):
             pid = str(r.get("project_id", "")).strip()
             key = pid if pid else json.dumps(r, ensure_ascii=False, sort_keys=True)
@@ -201,25 +172,17 @@ def fetch_records_search(resource_id: str) -> List[Dict[str, Any]]:
     return out
 
 def fetch_records_any(resource_id: str) -> List[Dict[str, Any]]:
-    # 1. รันบน GitHub ต้องใช้ Proxy เป็นตัวเลือกแรก เพราะ WAF บล็อกแน่ๆ
-    if PROXY_URL:
-        recs = fetch_records_via_proxy()
-        if recs: return recs
-        print("⚠️ เลื่อนไปใช้วิธีตรง (Direct) เนื่องจาก Proxy พลาด")
-
-    # 2. ลอง SQL แบบตรง
     try:
         return fetch_records_sql(resource_id)
     except Exception as e:
         print(f"⚠️ SQL failed: {e}")
 
-    # 3. ลอง datastore_search
     try:
         return fetch_records_search(resource_id)
     except Exception as e:
         print(f"⚠️ datastore_search failed: {e}")
 
-    raise RuntimeError("All fetch methods failed (Proxy, SQL, datastore_search).")
+    raise RuntimeError("All fetch methods failed (SQL, datastore_search).")
 
 # ======================
 # MAIN
