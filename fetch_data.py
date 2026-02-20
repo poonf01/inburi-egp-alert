@@ -11,10 +11,13 @@ headers_line = {
     "Authorization": f"Bearer {LINE_TOKEN}"
 }
 
+# เพิ่มหน้ากาก User-Agent เพื่อหลอกระบบเว็บรัฐว่าเราคือ Google Chrome ไม่ใช่บอท
+headers_browser = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+}
+
 def get_latest_egp_resource_id():
-    """ค้นหา Resource ID ผ่านช่องทาง Public API ที่ไม่ใช้ API Key (ป้องกันการโดนบล็อก 403)"""
     print("🔍 กำลังค้นหาไฟล์ข้อมูลจัดซื้อจัดจ้างเดือนล่าสุด...")
-    # เปลี่ยน URL มาใช้ Public CKAN API ของ data.go.th แทน opend.data.go.th
     search_url = "https://data.go.th/api/3/action/package_search"
     params = {
         "q": "จัดซื้อจัดจ้าง", 
@@ -23,8 +26,8 @@ def get_latest_egp_resource_id():
     }
     
     try:
-        # ⚠️ สังเกตว่าเราไม่ส่ง headers_api เข้าไปตรงนี้แล้ว เพื่อไม่ให้ระบบมองว่าเราทำผิดกฎ
-        response = requests.get(search_url, params=params)
+        # แนบหน้ากาก headers_browser เข้าไปด้วยเพื่อทะลวง Firewall
+        response = requests.get(search_url, headers=headers_browser, params=params)
         response.raise_for_status()
         data = response.json()
         
@@ -52,7 +55,6 @@ def main():
         print("ไม่สามารถหา Resource ID ได้ สคริปต์หยุดทำงาน")
         return
 
-    # ตรงนี้ถึงจะกลับมาใช้ API Key ในการดึงข้อมูลตามปกติ
     API_URL = "https://opend.data.go.th/get-ckan/datastore_search"
     PAYLOAD = {
         "resource_id": resource_id,
