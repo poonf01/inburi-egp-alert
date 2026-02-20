@@ -4,34 +4,43 @@ import time
 import requests
 from typing import Any, Dict, List, Optional
 
+# ======================
+# ENV
+# ======================
 LINE_TOKEN = os.environ.get("LINE_TOKEN", "").strip()
 API_KEY = os.environ.get("DATA_API_KEY", "").strip()
 RESOURCE_ID = os.environ.get("DATA_RESOURCE_ID", "").strip()
 
-# --- Common headers ---
-HEADERS_BROWSER = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    )
-}
+# ======================
+# CONSTANTS
+# ======================
+OPEND_DATASTORE_SQL = "https://opend.data.go.th/get-ckan/datastore_search_sql"
+LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
+DATA_JSON_PATH = "data.json"
 
+
+# ======================
+# HEADERS (สำคัญมากกับ data.go.th/opend.data.go.th)
+# ======================
 HEADERS_API = {
-    **HEADERS_BROWSER,
     "api-key": API_KEY,
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://data.go.th/",
+    "Origin": "https://data.go.th",
 }
 
 HEADERS_LINE = {
-    **HEADERS_BROWSER,
     "Content-Type": "application/json",
     "Authorization": f"Bearer {LINE_TOKEN}",
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0",
 }
 
-OPEND_DATASTORE_SEARCH = "https://opend.data.go.th/get-ckan/datastore_search"
-LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 
-
+# ======================
+# HELPERS
+# ======================
 def require_env() -> bool:
     missing = []
     if not API_KEY:
@@ -43,7 +52,7 @@ def require_env() -> bool:
 
     if missing:
         print("❌ Missing environment variables:", ", ".join(missing))
-        print("👉 แก้โดยไปที่ GitHub > Settings > Secrets and variables > Actions")
+        print("👉 ไปที่ GitHub Repo > Settings > Secrets and variables > Actions")
         print("   แล้วเพิ่ม Secrets ให้ครบ: LINE_TOKEN, DATA_API_KEY, DATA_RESOURCE_ID")
         return False
     return True
@@ -53,21 +62,25 @@ def http_get_with_retry(
     url: str,
     headers: Dict[str, str],
     params: Dict[str, Any],
-    retries: int = 4,
-    timeout: int = 30,
+    retries: int = 5,
+    timeout: int = 40,
 ) -> requests.Response:
     last_exc: Optional[Exception] = None
+
     for i in range(retries):
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-            # ถ้าโดน 403/429 ให้ลองใหม่แบบถอยหลัง
+
+            # เจอ status ที่มักเป็นชั่วคราว/โดน rate-limit -> backoff แล้วลองใหม่
             if resp.status_code in (403, 429, 500, 502, 503, 504):
                 wait = 2 ** i
                 print(f"⚠️ HTTP {resp.status_code} retry in {wait}s ...")
                 time.sleep(wait)
                 continue
+
             resp.raise_for_status()
             return resp
+
         except Exception as e:
             last_exc = e
             wait = 2 ** i
@@ -77,8 +90,24 @@ def http_get_with_retry(
     raise RuntimeError(f"Request failed after retries: {last_exc}")
 
 
+def load_old_data(path: str = DATA_JSON_PATH) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_data(items: List[Dict[str, Any]], path: str = DATA_JSON_PATH) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
 def send_line_notify(project_name: str, budget: str, department: str) -> None:
-    # ถ้า token ว่าง อย่าส่ง
+    # กันพัง ถ้า token หาย
     if not LINE_TOKEN:
         return
 
@@ -91,6 +120,7 @@ def send_line_notify(project_name: str, budget: str, department: str) -> None:
     )
 
     payload = {"messages": [{"type": "text", "text": message}]}
+
     try:
         resp = requests.post(
             LINE_BROADCAST_URL,
@@ -98,27 +128,34 @@ def send_line_notify(project_name: str, budget: str, department: str) -> None:
             json=payload,
             timeout=30,
         )
-        # ไม่ให้สคริปต์ล้มเพราะ LINE อย่างเดียว
         if resp.status_code >= 400:
             print(f"⚠️ LINE notify failed: HTTP {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"⚠️ LINE notify exception: {e}")
 
 
-def load_old_data(path: str = "data.json") -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
+# ======================
+# MAIN LOGIC
+# ======================
+def fetch_records_sql(resource_id: str) -> List[Dict[str, Any]]:
+    """
+    ดึงข้อมูลด้วย datastore_search_sql (มักรอดจาก 403 มากกว่า datastore_search)
+    """
+    # ปรับ WHERE ได้ตามต้องการ
+    sql = f"""
+    SELECT *
+    FROM "{resource_id}"
+    WHERE project_name LIKE '%อินทร์บุรี%'
+       OR prov_name LIKE '%สิงห์บุรี%'
+       OR dept_name LIKE '%อินทร์บุรี%'
+    LIMIT 200
+    """
 
+    params = {"sql": sql}
 
-def save_data(items: List[Dict[str, Any]], path: str = "data.json") -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    resp = http_get_with_retry(OPEND_DATASTORE_SQL, headers=HEADERS_API, params=params)
+    data = resp.json()
+    return data.get("result", {}).get("records", []) or []
 
 
 def main() -> None:
@@ -128,37 +165,23 @@ def main() -> None:
     print("✅ Environment OK")
     print(f"🔧 Using DATA_RESOURCE_ID: {RESOURCE_ID}")
 
-    # ดึงข้อมูลเฉพาะ keyword "อินทร์บุรี" (ปรับได้)
-    params = {
-        "resource_id": RESOURCE_ID,
-        "q": "อินทร์บุรี",
-        "limit": 200,
-    }
-
-    print("📥 กำลังดึงข้อมูลจาก opend.data.go.th ...")
+    print("📥 กำลังดึงข้อมูลจาก opend.data.go.th (SQL) ...")
     try:
-        resp = http_get_with_retry(OPEND_DATASTORE_SEARCH, headers=HEADERS_API, params=params)
-        data = resp.json()
-        records = data.get("result", {}).get("records", []) or []
-        print(f"✅ ดึงสำเร็จ: {len(records)} รายการ (จาก query อินทร์บุรี)")
+        records = fetch_records_sql(RESOURCE_ID)
+        print(f"✅ ดึงสำเร็จ: {len(records)} รายการ")
     except Exception as e:
         print(f"❌ ดึงข้อมูลล้มเหลว: {e}")
         return
 
-    # filter เพิ่มอีกชั้น เผื่อบาง record ไม่มี prov_name แต่มีข้อความ
-    inburi_projects = [
-        r for r in records
-        if ("อินทร์บุรี" in str(r)) or ("สิงห์บุรี" in str(r.get("prov_name", "")))
-    ]
-
-    old_data = load_old_data("data.json")
+    # โหลด data เก่า
+    old_data = load_old_data(DATA_JSON_PATH)
     old_ids = {str(x.get("project_id")) for x in old_data if isinstance(x, dict)}
 
+    # หาโครงการใหม่
     new_projects: List[Dict[str, Any]] = []
-    for proj in inburi_projects:
+    for proj in records:
         proj_id = str(proj.get("project_id", "")).strip()
         if not proj_id:
-            # ถ้าไม่มี id ก็ข้าม เพื่อไม่ให้แจ้งซ้ำ
             continue
         if proj_id not in old_ids:
             new_projects.append(proj)
@@ -171,14 +194,14 @@ def main() -> None:
                 str(proj.get("sum_price_agree", "ไม่ระบุ")),
                 str(proj.get("dept_name", "ไม่ระบุหน่วยงาน")),
             )
+            print(f"📨 แจ้งแล้ว: {proj.get('project_name')}")
 
         # เก็บใหม่ไว้บนสุด
-        save_data(new_projects + old_data, "data.json")
+        save_data(new_projects + old_data, DATA_JSON_PATH)
         print("✅ อัปเดต data.json เรียบร้อย")
     else:
-        # ให้มีไฟล์ data.json เสมอ
-        if not os.path.exists("data.json"):
-            save_data([], "data.json")
+        if not os.path.exists(DATA_JSON_PATH):
+            save_data([], DATA_JSON_PATH)
         print("😴 วันนี้ไม่มีโครงการใหม่ของอินทร์บุรี")
 
 
