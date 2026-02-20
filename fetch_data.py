@@ -5,6 +5,11 @@ import requests
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 API_KEY = os.environ.get("DATA_API_KEY")
 
+# Allow users to manually specify a resource ID via environment to avoid
+# package_search lookups. Useful if the search endpoint is unavailable.
+MANUAL_RESOURCE_ID = os.environ.get("DATA_RESOURCE_ID")
+
+# Header for API requests that require an API key
 headers_api = {"api-key": API_KEY}
 headers_line = {
     "Content-Type": "application/json",
@@ -16,31 +21,58 @@ headers_browser = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 }
 
-def get_latest_egp_resource_id():
+def get_latest_egp_resource_id() -> str | None:
+    """
+    Search for the most recently updated e-GP dataset on data.go.th and
+    return the identifier of its downloadable resource (CSV/API/JSON).
+
+    Uses the `package_search` endpoint on the opend.data.go.th service,
+    which requires an API key. Combining the API key header with a
+    browser-like User-Agent helps bypass basic firewall and rate limits.
+
+    Returns:
+        The resource ID string if found, otherwise None.
+    """
     print("🔍 กำลังค้นหาไฟล์ข้อมูลจัดซื้อจัดจ้างเดือนล่าสุด...")
-    search_url = "https://data.go.th/api/3/action/package_search"
+    # Use the opend data portal which expects an API key in the header.
+    search_url = "https://opend.data.go.th/get-ckan/package_search"
     params = {
-        "q": "จัดซื้อจัดจ้าง", 
+        "q": "จัดซื้อจัดจ้าง",
+        # sort by most recently modified metadata first
         "sort": "metadata_modified desc",
-        "rows": 3
+        "rows": 3,
     }
-    
     try:
-        # แนบหน้ากาก headers_browser เข้าไปด้วยเพื่อทะลวง Firewall
-        response = requests.get(search_url, headers=headers_browser, params=params)
+        # Merge API key and browser headers so both are sent
+        search_headers = {}
+        if headers_browser:
+            search_headers.update(headers_browser)
+        if headers_api:
+            search_headers.update(headers_api)
+
+        # Perform the search
+        response = requests.get(search_url, headers=search_headers, params=params)
         response.raise_for_status()
         data = response.json()
-        
+
+        # Iterate through returned packages and pick the newest resource
         for pkg in data.get("result", {}).get("results", []):
             resources = pkg.get("resources", [])
             if resources:
+                # Reverse iterate to pick the last defined resource first
                 for res in reversed(resources):
-                    if res.get("format", "").lower() in ["csv", "api", "json"]:
-                        print(f"✅ เจอไฟล์ล่าสุดแล้ว: {res.get('name')} (รหัส: {res.get('id')})")
-                        return res.get("id")
+                    fmt = (res.get("format") or "").lower()
+                    if fmt in {"csv", "api", "json"}:
+                        resource_id = res.get("id")
+                        print(
+                            f"✅ เจอไฟล์ล่าสุดแล้ว: {res.get('name')} (รหัส: {resource_id})"
+                        )
+                        return resource_id
+        print("⚠️ ไม่พบ Resource ที่มีรูปแบบ CSV/API/JSON ในแพ็คเกจที่ค้นพบ")
     except Exception as e:
+        # Log detailed error and return None so the caller can handle it
         print(f"❌ ค้นหา Resource ID อัตโนมัติไม่สำเร็จ: {e}")
-        return None
+    return None
 
 def send_line_notify(project_name, budget, department):
     url = "https://api.line.me/v2/bot/message/broadcast"
@@ -50,10 +82,18 @@ def send_line_notify(project_name, budget, department):
     requests.post(url, headers=headers_line, json=data)
 
 def main():
-    resource_id = get_latest_egp_resource_id()
-    if not resource_id:
-        print("ไม่สามารถหา Resource ID ได้ สคริปต์หยุดทำงาน")
-        return
+    # Use the manually provided resource ID if available, otherwise search for it.
+    resource_id = None
+    if MANUAL_RESOURCE_ID:
+        print(
+            f"🔧 ใช้ Resource ID ที่กำหนดผ่าน environment: {MANUAL_RESOURCE_ID}"
+        )
+        resource_id = MANUAL_RESOURCE_ID
+    else:
+        resource_id = get_latest_egp_resource_id()
+        if not resource_id:
+            print("ไม่สามารถหา Resource ID ได้ สคริปต์หยุดทำงาน")
+            return
 
     API_URL = "https://opend.data.go.th/get-ckan/datastore_search"
     PAYLOAD = {
