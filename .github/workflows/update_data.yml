@@ -27,6 +27,7 @@ jobs:
         env:
           LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
           DATA_API_KEY: ${{ secrets.DATA_API_KEY }}
+          DATA_RESOURCE_ID: ${{ secrets.DATA_RESOURCE_ID }}
         run: python fetch_data.py
 
       - name: Commit and Push changes
