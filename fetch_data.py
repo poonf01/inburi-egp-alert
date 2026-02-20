@@ -1,8 +1,10 @@
 import os
 import json
 import time
+import subprocess
+import urllib.parse
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ======================
 # ENV
@@ -11,21 +13,36 @@ LINE_TOKEN = os.environ.get("LINE_TOKEN", "").strip()
 API_KEY = os.environ.get("DATA_API_KEY", "").strip()
 RESOURCE_ID = os.environ.get("DATA_RESOURCE_ID", "").strip()
 
+# (ทางเลือก) ถ้าจะใช้ proxy ที่รันไว้ที่อื่น (Render/Railway/VPS)
+PROXY_URL = os.environ.get("PROXY_URL", "").strip().rstrip("/")
+
 # ======================
 # CONSTANTS
 # ======================
 OPEND_DATASTORE_SQL = "https://opend.data.go.th/get-ckan/datastore_search_sql"
+OPEND_DATASTORE_SEARCH = "https://opend.data.go.th/get-ckan/datastore_search"
+
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 DATA_JSON_PATH = "data.json"
 
-
 # ======================
-# HEADERS (สำคัญมากกับ data.go.th/opend.data.go.th)
+# HEADERS (กัน WAF ให้เต็ม)
 # ======================
+# NOTE: ใส่ทั้ง api-key และ x-api-key เผื่อ gateway บางตัวเช็คคนละชื่อ
 HEADERS_API = {
     "api-key": API_KEY,
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0",
+    "x-api-key": API_KEY,
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+    # UA ให้เหมือน Chrome จริง (หลาย WAF บล็อก UA สั้น ๆ)
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
     "Referer": "https://data.go.th/",
     "Origin": "https://data.go.th",
 }
@@ -36,7 +53,6 @@ HEADERS_LINE = {
     "Accept": "application/json",
     "User-Agent": "Mozilla/5.0",
 }
-
 
 # ======================
 # HELPERS
@@ -52,42 +68,105 @@ def require_env() -> bool:
 
     if missing:
         print("❌ Missing environment variables:", ", ".join(missing))
-        print("👉 ไปที่ GitHub Repo > Settings > Secrets and variables > Actions")
-        print("   แล้วเพิ่ม Secrets ให้ครบ: LINE_TOKEN, DATA_API_KEY, DATA_RESOURCE_ID")
+        print("👉 GitHub Repo > Settings > Secrets and variables > Actions")
+        print("   เพิ่ม Secrets ให้ครบ: LINE_TOKEN, DATA_API_KEY, DATA_RESOURCE_ID")
         return False
     return True
 
 
-def http_get_with_retry(
+def _short(text: str, n: int = 250) -> str:
+    t = (text or "").replace("\n", " ").replace("\r", " ").strip()
+    return t[:n]
+
+
+def _build_url(url: str, params: Dict[str, Any]) -> str:
+    q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    return f"{url}?{q}" if q else url
+
+
+def _curl_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
+    full_url = _build_url(url, params)
+
+    cmd = [
+        "curl",
+        "-sS",
+        "-L",
+        "--compressed",
+        "--connect-timeout",
+        str(timeout),
+        "--max-time",
+        str(timeout),
+        full_url,
+    ]
+    for k, v in headers.items():
+        if v:
+            cmd.insert(-1, f"{k}: {v}")
+            cmd.insert(-1, "-H")
+
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"curl failed rc={p.returncode}: {_short(p.stderr)}")
+
+    try:
+        return json.loads(p.stdout)
+    except Exception:
+        raise RuntimeError(f"curl returned non-json: {_short(p.stdout)}")
+
+
+def _requests_get_json(
     url: str,
     headers: Dict[str, str],
     params: Dict[str, Any],
-    retries: int = 5,
-    timeout: int = 40,
-) -> requests.Response:
-    last_exc: Optional[Exception] = None
+    retries: int = 4,
+    timeout: int = 45,
+) -> Dict[str, Any]:
+    """
+    requests ก่อน -> ถ้าโดน 403/429/5xx จะ retry และสุดท้าย throw error ที่มีรายละเอียดจริง
+    """
+    session = requests.Session()
+    last_err: Optional[Exception] = None
 
     for i in range(retries):
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            resp = session.get(url, headers=headers, params=params, timeout=timeout)
 
-            # เจอ status ที่มักเป็นชั่วคราว/โดน rate-limit -> backoff แล้วลองใหม่
+            # OK
+            if resp.status_code < 400:
+                return resp.json()
+
+            body = _short(resp.text)
+            # 403: มักโดน WAF บล็อก -> ไม่ต้องรอให้ครบทุก retry ก็ได้ แต่ให้ลองอีกครั้ง 1-2 รอบเผื่อชั่วคราว
             if resp.status_code in (403, 429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"HTTP {resp.status_code}: {body}")
                 wait = 2 ** i
-                print(f"⚠️ HTTP {resp.status_code} retry in {wait}s ...")
+                print(f"⚠️ HTTP {resp.status_code} retry in {wait}s ... ({body})")
                 time.sleep(wait)
                 continue
 
             resp.raise_for_status()
-            return resp
+            return resp.json()
 
         except Exception as e:
-            last_exc = e
+            last_err = e
             wait = 2 ** i
             print(f"⚠️ Request error retry in {wait}s ... ({e})")
             time.sleep(wait)
 
-    raise RuntimeError(f"Request failed after retries: {last_exc}")
+    raise RuntimeError(f"requests failed after retries: {last_err}")
+
+
+def get_json_with_fallback(url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    1) requests (มี retry)
+    2) ถ้ายังพัง -> curl (มักผ่าน WAF ได้)
+    """
+    try:
+        return _requests_get_json(url, headers, params)
+    except Exception as e1:
+        print(f"⚠️ requests failed -> trying curl fallback ... ({e1})")
+
+    # curl fallback (ไม่ retry ยาว ๆ ให้เสียเวลา)
+    return _curl_get_json(url, headers, params, timeout=70)
 
 
 def load_old_data(path: str = DATA_JSON_PATH) -> List[Dict[str, Any]]:
@@ -107,7 +186,6 @@ def save_data(items: List[Dict[str, Any]], path: str = DATA_JSON_PATH) -> None:
 
 
 def send_line_notify(project_name: str, budget: str, department: str) -> None:
-    # กันพัง ถ้า token หาย
     if not LINE_TOKEN:
         return
 
@@ -129,19 +207,15 @@ def send_line_notify(project_name: str, budget: str, department: str) -> None:
             timeout=30,
         )
         if resp.status_code >= 400:
-            print(f"⚠️ LINE notify failed: HTTP {resp.status_code} {resp.text[:200]}")
+            print(f"⚠️ LINE notify failed: HTTP {resp.status_code} {_short(resp.text)}")
     except Exception as e:
         print(f"⚠️ LINE notify exception: {e}")
 
 
 # ======================
-# MAIN LOGIC
+# FETCH
 # ======================
 def fetch_records_sql(resource_id: str) -> List[Dict[str, Any]]:
-    """
-    ดึงข้อมูลด้วย datastore_search_sql (มักรอดจาก 403 มากกว่า datastore_search)
-    """
-    # ปรับ WHERE ได้ตามต้องการ
     sql = f"""
     SELECT *
     FROM "{resource_id}"
@@ -150,34 +224,97 @@ def fetch_records_sql(resource_id: str) -> List[Dict[str, Any]]:
        OR dept_name LIKE '%อินทร์บุรี%'
     LIMIT 200
     """
-
-    params = {"sql": sql}
-
-    resp = http_get_with_retry(OPEND_DATASTORE_SQL, headers=HEADERS_API, params=params)
-    data = resp.json()
+    data = get_json_with_fallback(OPEND_DATASTORE_SQL, headers=HEADERS_API, params={"sql": sql})
     return data.get("result", {}).get("records", []) or []
 
 
+def fetch_records_search(resource_id: str) -> List[Dict[str, Any]]:
+    """
+    fallback อีกชั้น: datastore_search (ไม่ใช้ SQL)
+    ทำ 2 ครั้งแล้ว union กัน เพื่อเลี่ยงปัญหา AND/OR ใน q
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for q in ["อินทร์บุรี", "สิงห์บุรี"]:
+        data = get_json_with_fallback(
+            OPEND_DATASTORE_SEARCH,
+            headers=HEADERS_API,
+            params={"resource_id": resource_id, "q": q, "limit": 200},
+        )
+        recs = data.get("result", {}).get("records", []) or []
+        for r in recs:
+            pid = str(r.get("project_id", "")).strip()
+            key = pid if pid else json.dumps(r, ensure_ascii=False, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+
+    return out
+
+
+def fetch_records_via_proxy() -> List[Dict[str, Any]]:
+    """
+    ต้องมี PROXY_URL ตั้งไว้ เช่น https://xxx.onrender.com
+    endpoint: /egp -> คืน JSON แบบเดียวกับ CKAN
+    """
+    if not PROXY_URL:
+        return []
+
+    url = f"{PROXY_URL}/egp"
+    print(f"🌐 Using PROXY_URL: {url}")
+
+    # proxy เราไม่ต้องส่ง api-key ก็ได้ (เพราะ proxy เก็บ key เอง)
+    try:
+        data = get_json_with_fallback(url, headers={"Accept": "application/json"}, params={})
+        return data.get("result", {}).get("records", []) or []
+    except Exception as e:
+        print(f"⚠️ proxy fetch failed: {e}")
+        return []
+
+
+def fetch_records_any(resource_id: str) -> List[Dict[str, Any]]:
+    # 1) SQL ก่อน (ดีที่สุด)
+    try:
+        return fetch_records_sql(resource_id)
+    except Exception as e:
+        print(f"⚠️ SQL failed: {e}")
+
+    # 2) datastore_search
+    try:
+        return fetch_records_search(resource_id)
+    except Exception as e:
+        print(f"⚠️ datastore_search failed: {e}")
+
+    # 3) proxy (ถ้ามี)
+    recs = fetch_records_via_proxy()
+    if recs:
+        return recs
+
+    # ถ้ายังไม่มา แปลว่าโดนบล็อกหนัก/คีย์ไม่ผ่านจริง ๆ
+    raise RuntimeError("All fetch methods failed (SQL, datastore_search, proxy).")
+
+
+# ======================
+# MAIN
+# ======================
 def main() -> None:
     if not require_env():
         return
 
     print("✅ Environment OK")
-    print(f"🔧 Using DATA_RESOURCE_ID: {RESOURCE_ID}")
+    print("📥 กำลังดึงข้อมูลจาก opend.data.go.th ...")
 
-    print("📥 กำลังดึงข้อมูลจาก opend.data.go.th (SQL) ...")
     try:
-        records = fetch_records_sql(RESOURCE_ID)
+        records = fetch_records_any(RESOURCE_ID)
         print(f"✅ ดึงสำเร็จ: {len(records)} รายการ")
     except Exception as e:
         print(f"❌ ดึงข้อมูลล้มเหลว: {e}")
         return
 
-    # โหลด data เก่า
     old_data = load_old_data(DATA_JSON_PATH)
     old_ids = {str(x.get("project_id")) for x in old_data if isinstance(x, dict)}
 
-    # หาโครงการใหม่
     new_projects: List[Dict[str, Any]] = []
     for proj in records:
         proj_id = str(proj.get("project_id", "")).strip()
@@ -196,7 +333,6 @@ def main() -> None:
             )
             print(f"📨 แจ้งแล้ว: {proj.get('project_name')}")
 
-        # เก็บใหม่ไว้บนสุด
         save_data(new_projects + old_data, DATA_JSON_PATH)
         print("✅ อัปเดต data.json เรียบร้อย")
     else:
