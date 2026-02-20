@@ -1,151 +1,186 @@
 import os
 import json
+import time
 import requests
+from typing import Any, Dict, List, Optional
 
-LINE_TOKEN = os.environ.get("LINE_TOKEN")
-API_KEY = os.environ.get("DATA_API_KEY")
+LINE_TOKEN = os.environ.get("LINE_TOKEN", "").strip()
+API_KEY = os.environ.get("DATA_API_KEY", "").strip()
+RESOURCE_ID = os.environ.get("DATA_RESOURCE_ID", "").strip()
 
-# Allow users to manually specify a resource ID via environment to avoid
-# package_search lookups. Useful if the search endpoint is unavailable.
-MANUAL_RESOURCE_ID = os.environ.get("DATA_RESOURCE_ID")
+# --- Common headers ---
+HEADERS_BROWSER = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    )
+}
 
-# Header for API requests that require an API key
-headers_api = {"api-key": API_KEY}
-headers_line = {
+HEADERS_API = {
+    **HEADERS_BROWSER,
+    "api-key": API_KEY,
+}
+
+HEADERS_LINE = {
+    **HEADERS_BROWSER,
     "Content-Type": "application/json",
-    "Authorization": f"Bearer {LINE_TOKEN}"
+    "Authorization": f"Bearer {LINE_TOKEN}",
 }
 
-# เพิ่มหน้ากาก User-Agent เพื่อหลอกระบบเว็บรัฐว่าเราคือ Google Chrome ไม่ใช่บอท
-headers_browser = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-}
+OPEND_DATASTORE_SEARCH = "https://opend.data.go.th/get-ckan/datastore_search"
+LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 
-def get_latest_egp_resource_id() -> str | None:
-    """
-    Search for the most recently updated e-GP dataset on data.go.th and
-    return the identifier of its downloadable resource (CSV/API/JSON).
 
-    Uses the `package_search` endpoint on the opend.data.go.th service,
-    which requires an API key. Combining the API key header with a
-    browser-like User-Agent helps bypass basic firewall and rate limits.
+def require_env() -> bool:
+    missing = []
+    if not API_KEY:
+        missing.append("DATA_API_KEY")
+    if not LINE_TOKEN:
+        missing.append("LINE_TOKEN")
+    if not RESOURCE_ID:
+        missing.append("DATA_RESOURCE_ID")
 
-    Returns:
-        The resource ID string if found, otherwise None.
-    """
-    print("🔍 กำลังค้นหาไฟล์ข้อมูลจัดซื้อจัดจ้างเดือนล่าสุด...")
-    # Use the opend data portal which expects an API key in the header.
-    search_url = "https://opend.data.go.th/get-ckan/package_search"
-    params = {
-        "q": "จัดซื้อจัดจ้าง",
-        # sort by most recently modified metadata first
-        "sort": "metadata_modified desc",
-        "rows": 3,
-    }
-    try:
-        # Merge API key and browser headers so both are sent
-        search_headers = {}
-        if headers_browser:
-            search_headers.update(headers_browser)
-        if headers_api:
-            search_headers.update(headers_api)
+    if missing:
+        print("❌ Missing environment variables:", ", ".join(missing))
+        print("👉 แก้โดยไปที่ GitHub > Settings > Secrets and variables > Actions")
+        print("   แล้วเพิ่ม Secrets ให้ครบ: LINE_TOKEN, DATA_API_KEY, DATA_RESOURCE_ID")
+        return False
+    return True
 
-        # Perform the search
-        response = requests.get(search_url, headers=search_headers, params=params)
-        response.raise_for_status()
-        data = response.json()
 
-        # Iterate through returned packages and pick the newest resource
-        for pkg in data.get("result", {}).get("results", []):
-            resources = pkg.get("resources", [])
-            if resources:
-                # Reverse iterate to pick the last defined resource first
-                for res in reversed(resources):
-                    fmt = (res.get("format") or "").lower()
-                    if fmt in {"csv", "api", "json"}:
-                        resource_id = res.get("id")
-                        print(
-                            f"✅ เจอไฟล์ล่าสุดแล้ว: {res.get('name')} (รหัส: {resource_id})"
-                        )
-                        return resource_id
-        print("⚠️ ไม่พบ Resource ที่มีรูปแบบ CSV/API/JSON ในแพ็คเกจที่ค้นพบ")
-    except Exception as e:
-        # Log detailed error and return None so the caller can handle it
-        print(f"❌ ค้นหา Resource ID อัตโนมัติไม่สำเร็จ: {e}")
-    return None
+def http_get_with_retry(
+    url: str,
+    headers: Dict[str, str],
+    params: Dict[str, Any],
+    retries: int = 4,
+    timeout: int = 30,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for i in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            # ถ้าโดน 403/429 ให้ลองใหม่แบบถอยหลัง
+            if resp.status_code in (403, 429, 500, 502, 503, 504):
+                wait = 2 ** i
+                print(f"⚠️ HTTP {resp.status_code} retry in {wait}s ...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_exc = e
+            wait = 2 ** i
+            print(f"⚠️ Request error retry in {wait}s ... ({e})")
+            time.sleep(wait)
 
-def send_line_notify(project_name, budget, department):
-    url = "https://api.line.me/v2/bot/message/broadcast"
-    message = f"📢 มีประกาศจัดซื้อจัดจ้างใหม่ในพื้นที่!\n\n🏢 หน่วยงาน: {department}\n📌 โครงการ: {project_name}\n💰 งบประมาณ: {budget} บาท\n\n(by Alieninburi)"
-    
-    data = {"messages": [{"type": "text", "text": message}]}
-    requests.post(url, headers=headers_line, json=data)
+    raise RuntimeError(f"Request failed after retries: {last_exc}")
 
-def main():
-    # Use the manually provided resource ID if available, otherwise search for it.
-    resource_id = None
-    if MANUAL_RESOURCE_ID:
-        print(
-            f"🔧 ใช้ Resource ID ที่กำหนดผ่าน environment: {MANUAL_RESOURCE_ID}"
-        )
-        resource_id = MANUAL_RESOURCE_ID
-    else:
-        resource_id = get_latest_egp_resource_id()
-        if not resource_id:
-            print("ไม่สามารถหา Resource ID ได้ สคริปต์หยุดทำงาน")
-            return
 
-    API_URL = "https://opend.data.go.th/get-ckan/datastore_search"
-    PAYLOAD = {
-        "resource_id": resource_id,
-        "q": "อินทร์บุรี",
-        "limit": 100
-    }
-
-    print("กำลังดึงข้อมูลโครงการของอินทร์บุรี...")
-    try:
-        response = requests.get(API_URL, headers=headers_api, params=PAYLOAD)
-        response.raise_for_status()
-        data = response.json()
-        records = data.get("result", {}).get("records", [])
-    except Exception as e:
-        print(f"เกิดข้อผิดพลาดในการดึงข้อมูล: {e}")
+def send_line_notify(project_name: str, budget: str, department: str) -> None:
+    # ถ้า token ว่าง อย่าส่ง
+    if not LINE_TOKEN:
         return
 
-    inburi_projects = [r for r in records if "สิงห์บุรี" in str(r.get("prov_name", "")) or "อินทร์บุรี" in str(r)]
+    message = (
+        "📢 มีประกาศจัดซื้อจัดจ้างใหม่ในพื้นที่!\n\n"
+        f"🏢 หน่วยงาน: {department}\n"
+        f"📌 โครงการ: {project_name}\n"
+        f"💰 งบประมาณ: {budget} บาท\n\n"
+        "(by Alieninburi)"
+    )
 
-    old_data = []
-    if os.path.exists("data.json"):
-        with open("data.json", "r", encoding="utf-8") as f:
-            try:
-                old_data = json.load(f)
-            except json.JSONDecodeError:
-                old_data = []
+    payload = {"messages": [{"type": "text", "text": message}]}
+    try:
+        resp = requests.post(
+            LINE_BROADCAST_URL,
+            headers=HEADERS_LINE,
+            json=payload,
+            timeout=30,
+        )
+        # ไม่ให้สคริปต์ล้มเพราะ LINE อย่างเดียว
+        if resp.status_code >= 400:
+            print(f"⚠️ LINE notify failed: HTTP {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ LINE notify exception: {e}")
 
-    old_project_ids = {str(item.get("project_id")) for item in old_data}
-    new_projects = []
 
+def load_old_data(path: str = "data.json") -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_data(items: List[Dict[str, Any]], path: str = "data.json") -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+def main() -> None:
+    if not require_env():
+        return
+
+    print("✅ Environment OK")
+    print(f"🔧 Using DATA_RESOURCE_ID: {RESOURCE_ID}")
+
+    # ดึงข้อมูลเฉพาะ keyword "อินทร์บุรี" (ปรับได้)
+    params = {
+        "resource_id": RESOURCE_ID,
+        "q": "อินทร์บุรี",
+        "limit": 200,
+    }
+
+    print("📥 กำลังดึงข้อมูลจาก opend.data.go.th ...")
+    try:
+        resp = http_get_with_retry(OPEND_DATASTORE_SEARCH, headers=HEADERS_API, params=params)
+        data = resp.json()
+        records = data.get("result", {}).get("records", []) or []
+        print(f"✅ ดึงสำเร็จ: {len(records)} รายการ (จาก query อินทร์บุรี)")
+    except Exception as e:
+        print(f"❌ ดึงข้อมูลล้มเหลว: {e}")
+        return
+
+    # filter เพิ่มอีกชั้น เผื่อบาง record ไม่มี prov_name แต่มีข้อความ
+    inburi_projects = [
+        r for r in records
+        if ("อินทร์บุรี" in str(r)) or ("สิงห์บุรี" in str(r.get("prov_name", "")))
+    ]
+
+    old_data = load_old_data("data.json")
+    old_ids = {str(x.get("project_id")) for x in old_data if isinstance(x, dict)}
+
+    new_projects: List[Dict[str, Any]] = []
     for proj in inburi_projects:
-        proj_id = str(proj.get("project_id"))
-        if proj_id not in old_project_ids:
+        proj_id = str(proj.get("project_id", "")).strip()
+        if not proj_id:
+            # ถ้าไม่มี id ก็ข้าม เพื่อไม่ให้แจ้งซ้ำ
+            continue
+        if proj_id not in old_ids:
             new_projects.append(proj)
-            send_line_notify(
-                proj.get("project_name", "ไม่ระบุชื่อโครงการ"), 
-                proj.get("sum_price_agree", "ไม่ระบุ"), 
-                proj.get("dept_name", "ไม่ระบุหน่วยงาน")
-            )
-            print(f"ส่งแจ้งเตือน: {proj.get('project_name')}")
 
     if new_projects:
-        all_projects = new_projects + old_data
-        with open("data.json", "w", encoding="utf-8") as f:
-            json.dump(all_projects, f, ensure_ascii=False, indent=2)
-        print(f"อัปเดตไฟล์ data.json เรียบร้อย (เพิ่ม {len(new_projects)} รายการ)")
+        print(f"🆕 พบโครงการใหม่ {len(new_projects)} รายการ กำลังส่งแจ้งเตือน ...")
+        for proj in new_projects:
+            send_line_notify(
+                str(proj.get("project_name", "ไม่ระบุชื่อโครงการ")),
+                str(proj.get("sum_price_agree", "ไม่ระบุ")),
+                str(proj.get("dept_name", "ไม่ระบุหน่วยงาน")),
+            )
+
+        # เก็บใหม่ไว้บนสุด
+        save_data(new_projects + old_data, "data.json")
+        print("✅ อัปเดต data.json เรียบร้อย")
     else:
+        # ให้มีไฟล์ data.json เสมอ
         if not os.path.exists("data.json"):
-             with open("data.json", "w", encoding="utf-8") as f:
-                 json.dump([], f)
-        print("วันนี้ไม่มีโครงการใหม่ของอินทร์บุรี")
+            save_data([], "data.json")
+        print("😴 วันนี้ไม่มีโครงการใหม่ของอินทร์บุรี")
+
 
 if __name__ == "__main__":
     main()
